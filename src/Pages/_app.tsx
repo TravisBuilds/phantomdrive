@@ -7,11 +7,8 @@ export default function App({ Component, pageProps }: AppProps) {
     <>
       <Script
         id="google-maps"
-        strategy="beforeInteractive"
         src={`https://maps.googleapis.com/maps/api/js?key=${process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY}&libraries=places`}
-        onError={(e) => {
-          console.error('Google Maps failed to load:', e);
-        }}
+        strategy="beforeInteractive"
       />
       <Component {...pageProps} />
     </>

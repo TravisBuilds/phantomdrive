@@ -27,4 +27,19 @@ export interface RouteData {
   totalDistance: number;
   totalDuration: number;
   totalChargingTime: number;
+}
+
+export interface ChargeStop {
+  location: {
+    lat: number;
+    lng: number;
+  };
+  name: string;
+  duration: number;
+  distance: number;
+}
+
+export interface DirectionsWaypoint {
+  location: google.maps.LatLngLiteral;
+  stopover: boolean;
 } 

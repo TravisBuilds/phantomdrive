@@ -1,22 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { TeslaModel } from './TeslaModelSelect';
-
-interface Location {
-  lat: number;
-  lng: number;
-  address: string;
-}
+import { Location, ChargeStop } from '@/types';
 
 interface RoutePlannerProps {
   selectedModel: TeslaModel;
-  onLocationSelect: (location: { lat: number; lng: number }) => void;
-}
-
-interface ChargeStop {
-  location: { lat: number; lng: number };
-  name: string;
-  duration: number;
-  distance: number;
+  onLocationSelect: (location: google.maps.LatLngLiteral) => void;
 }
 
 export default function RoutePlanner({ selectedModel, onLocationSelect }: RoutePlannerProps) {
@@ -30,6 +18,15 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
   const [directionsRenderer, setDirectionsRenderer] = useState<google.maps.DirectionsRenderer | null>(null);
   const [searchInput, setSearchInput] = useState('');
   const autocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
+  const [startLocation, setStartLocation] = useState<Location | null>(null);
+  const [isSettingStart, setIsSettingStart] = useState(true);
+
+  const directionsService = useRef<google.maps.DirectionsService | null>(null);
+
+  const toLatLng = (location: Location): google.maps.LatLngLiteral => ({
+    lat: location.lat,
+    lng: location.lng
+  });
 
   const initMap = () => {
     if (!mapRef.current || !window.google) {
@@ -40,7 +37,7 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
 
     try {
       const mapInstance = new google.maps.Map(mapRef.current, {
-        center: { lat: 40.7128, lng: -74.0060 },
+        center: { lat: 44.4280, lng: -110.5885 },
         zoom: 8,
         mapTypeControl: true,
         streetViewControl: true,
@@ -49,66 +46,167 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
 
       setMap(mapInstance);
 
-      const input = document.getElementById('location-input') as HTMLInputElement;
-      const autocomplete = new google.maps.places.Autocomplete(input, {
-        fields: ['address_components', 'geometry', 'name', 'formatted_address'],
-      });
-      
-      autocompleteRef.current = autocomplete;
-      autocomplete.bindTo('bounds', mapInstance);
-
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          handleAddStop();
-        }
-      });
-
-      autocomplete.addListener('place_changed', () => {
-        handlePlaceSelect();
-      });
+      // Setup Places Autocomplete
+      setupPlacesAutocomplete(mapInstance);
     } catch (error) {
       console.error('Map initialization error:', error);
       setError('Failed to initialize map. Please refresh the page or try again later.');
     }
   };
 
+  // Add this helper function back
+  const getFormattedAddress = (place: google.maps.places.PlaceResult): string => {
+    if (place.name && place.types?.includes('establishment')) {
+      return place.name;
+    }
+    return place.formatted_address || place.name || '';
+  };
+
+  // Update the setupPlacesAutocomplete function
+  const setupPlacesAutocomplete = (mapInstance: google.maps.Map) => {
+    const input = document.getElementById('location-input') as HTMLInputElement;
+    if (!input) return;
+
+    // Remove any existing autocomplete
+    if (autocompleteRef.current) {
+      google.maps.event.clearInstanceListeners(autocompleteRef.current);
+    }
+
+    const autocomplete = new google.maps.places.Autocomplete(input, {
+      fields: ['geometry', 'formatted_address', 'name']
+    });
+
+    autocomplete.bindTo('bounds', mapInstance);
+    autocompleteRef.current = autocomplete;
+
+    const listener = google.maps.event.addListener(autocomplete, 'place_changed', async () => {
+      const place = autocomplete.getPlace();
+      
+      if (!place.geometry || !place.geometry.location) {
+        setError('No location details available for this place');
+        return;
+      }
+
+      const location: Location = {
+        lat: place.geometry.location.lat(),
+        lng: place.geometry.location.lng(),
+        address: place.formatted_address || place.name || ''
+      };
+
+      try {
+        if (isSettingStart) {
+          await setStart(location);
+        } else {
+          await addStop(location);
+        }
+        setSearchInput('');
+        setError(null);
+      } catch (error) {
+        console.error('Error adding location:', error);
+        setError('Failed to add location');
+      }
+    });
+
+    return listener;
+  };
+
   useEffect(() => {
     if (window.google && mapRef.current) {
       initMap();
       
-      // Initialize DirectionsRenderer
+      // Initialize DirectionsRenderer and DirectionsService
       const renderer = new google.maps.DirectionsRenderer({
-        suppressMarkers: true, // We'll handle markers ourselves
+        suppressMarkers: true,
         preserveViewport: true
       });
       setDirectionsRenderer(renderer);
+      directionsService.current = new google.maps.DirectionsService();
+
+      // Cleanup function
+      return () => {
+        // Clear all markers
+        markers.forEach(marker => marker.setMap(null));
+        // Clear directions renderer
+        if (renderer) {
+          renderer.setMap(null);
+        }
+        // Clear autocomplete listeners
+        if (autocompleteRef.current) {
+          google.maps.event.clearInstanceListeners(autocompleteRef.current);
+        }
+      };
     }
-  }, []);
+  }, []); // Empty dependency array since we only want this to run once
 
-  const addStop = async (location: Location) => {
-    const newStops = [...stops, location];
-    setStops(newStops);
+  const setStart = async (location: Location) => {
+    // Clear everything
+    markers.forEach(marker => marker.setMap(null));
+    setMarkers([]);
+    setStops([]);
+    setChargeStops([]);
+    if (directionsRenderer) {
+      directionsRenderer.setMap(null);
+    }
 
-    // Create a marker for the new stop
+    // Set the new start location
+    setStartLocation(location);
+    setIsSettingStart(false);
+
+    // Create marker for start location
     if (map) {
       const marker = new google.maps.Marker({
-        position: { lat: location.lat, lng: location.lng },
+        position: toLatLng(location),
         map,
-        label: `${newStops.length}`,
-        title: location.address
+        label: 'A',
+        title: `Start: ${location.address}`
       });
-      setMarkers([...markers, marker]);
+      setMarkers([marker]);
+    }
+
+    // Pan to the start location
+    map?.panTo(toLatLng(location));
+    map?.setZoom(13);
+  };
+
+  const addStop = async (location: Location) => {
+    if (!startLocation) {
+      await setStart(location);
+      return;
+    }
+
+    // Clear existing markers
+    markers.forEach(marker => marker.setMap(null));
+
+    // Just set the destination
+    setStops([location]);
+
+    // Create markers for both start and destination
+    if (map) {
+      const newMarkers = [
+        // Start marker (A)
+        new google.maps.Marker({
+          position: toLatLng(startLocation),
+          map,
+          label: 'A',
+          title: `Start: ${startLocation.address}`
+        }),
+        // Destination marker (B)
+        new google.maps.Marker({
+          position: toLatLng(location),
+          map,
+          label: 'B',
+          title: `Destination: ${location.address}`
+        })
+      ];
+      setMarkers(newMarkers);
     }
 
     // Pan to the new location
-    map?.panTo({ lat: location.lat, lng: location.lng });
+    map?.panTo(toLatLng(location));
     map?.setZoom(13);
 
-    // Only calculate route if we have at least 2 stops
-    if (newStops.length >= 2) {
-      await calculateRoute(newStops);
-    }
+    // Calculate route between start and destination
+    await calculateRoute([startLocation, location]);
   };
 
   const calculateRoute = async (routeStops: Location[]) => {
@@ -116,23 +214,54 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
     setError(null);
 
     try {
+      // Make sure we have both start and destination
+      if (routeStops.length < 2) {
+        throw new Error('Need both start and destination locations');
+      }
+
+      // Create a clean request body without any extra properties
+      const requestBody = {
+        origin: {
+          lat: routeStops[0].lat,
+          lng: routeStops[0].lng,
+          address: routeStops[0].address
+        },
+        destination: {
+          lat: routeStops[routeStops.length - 1].lat,
+          lng: routeStops[routeStops.length - 1].lng,
+          address: routeStops[routeStops.length - 1].address
+        },
+        waypoints: routeStops.slice(1, -1).map(stop => ({
+          lat: stop.lat,
+          lng: stop.lng,
+          address: stop.address
+        })),
+        model: {
+          id: selectedModel.id,
+          name: selectedModel.name,
+          range: selectedModel.range,
+          chargingSpeed: selectedModel.chargingSpeed
+        }
+      };
+
+      console.log('Request body:', requestBody);
+
       const response = await fetch('/api/routes/calculate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          origin: routeStops[0],
-          destination: routeStops[routeStops.length - 1],
-          waypoints: routeStops.slice(1, -1),
-          model: selectedModel
-        })
+        body: JSON.stringify(requestBody)
       });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null);
+        throw new Error(
+          errorData?.message || 
+          `Failed to calculate route (${response.status})`
+        );
+      }
 
       const data = await response.json();
       
-      if (!response.ok) {
-        throw new Error(data.message || 'Failed to calculate route');
-      }
-
       if (!data.route || !Array.isArray(data.route)) {
         throw new Error('Invalid route data received');
       }
@@ -140,7 +269,7 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
       setChargeStops(data.chargeStops || []);
       displayRoute(data.route);
       onLocationSelect(routeStops[routeStops.length - 1]);
-      
+
     } catch (error) {
       console.error('Route calculation error:', error);
       setError(error instanceof Error ? error.message : 'Failed to calculate route');
@@ -150,7 +279,7 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
   };
 
   const displayRoute = (routePath: Array<{ lat: number; lng: number }>) => {
-    if (!map) return;
+    if (!map || !startLocation) return;
 
     // Clear existing markers
     markers.forEach(marker => marker.setMap(null));
@@ -158,143 +287,87 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
     // Create new markers array
     const newMarkers: google.maps.Marker[] = [];
 
-    // Add markers for stops
-    stops.forEach((stop, index) => {
-      const marker = new google.maps.Marker({
-        position: { lat: stop.lat, lng: stop.lng },
-        map,
-        label: `${index + 1}`,
-        title: stop.address
-      });
-      newMarkers.push(marker);
+    // Add marker for start location
+    const startMarker = new google.maps.Marker({
+      position: toLatLng(startLocation),
+      map,
+      label: 'A',
+      title: `Start: ${startLocation.address}`
     });
+    newMarkers.push(startMarker);
 
-    // Add markers for charging stops
-    chargeStops.forEach((stop) => {
-      const marker = new google.maps.Marker({
-        position: stop.location,
+    // Add marker for destination
+    if (stops.length > 0) {
+      const destinationMarker = new google.maps.Marker({
+        position: toLatLng(stops[stops.length - 1]),
         map,
-        icon: {
-          url: '/charging-station.png', // Add this icon to your public folder
-          scaledSize: new google.maps.Size(24, 24)
-        },
-        title: `${stop.name} - ${Math.round(stop.duration)}min charge`
+        label: 'B',
+        title: `Destination: ${stops[stops.length - 1].address}`
       });
-      newMarkers.push(marker);
-    });
+      newMarkers.push(destinationMarker);
+    }
+
+    // Add markers for charging stops if they exist
+    if (chargeStops?.length > 0) {
+      chargeStops.forEach((stop) => {
+        if (stop?.location) {
+          const marker = new google.maps.Marker({
+            position: stop.location,
+            map,
+            icon: {
+              url: '/charging-station.png',
+              scaledSize: new google.maps.Size(24, 24)
+            },
+            title: `${stop.name} - ${Math.round(stop.duration)}min charge`
+          });
+          newMarkers.push(marker);
+        }
+      });
+    }
 
     setMarkers(newMarkers);
 
     // Draw route line using DirectionsService
-    if (stops.length >= 2 && directionsRenderer) {
-      const directionsService = new google.maps.DirectionsService();
+    if (stops.length > 0 && directionsRenderer && directionsService.current) {
+      directionsRenderer.setMap(map);
       
-      directionsService.route({
-        origin: { lat: stops[0].lat, lng: stops[0].lng },
-        destination: { lat: stops[stops.length - 1].lat, lng: stops[stops.length - 1].lng },
-        waypoints: stops.slice(1, -1).map(stop => ({
-          location: { lat: stop.lat, lng: stop.lng },
+      const request: google.maps.DirectionsRequest = {
+        origin: toLatLng(startLocation),
+        destination: toLatLng(stops[stops.length - 1]),
+        waypoints: stops.slice(0, -1).map(stop => ({
+          location: toLatLng(stop),
           stopover: true
         })),
         travelMode: google.maps.TravelMode.DRIVING
-      }, (result, status) => {
+      };
+
+      directionsService.current.route(request, (result, status) => {
         if (status === google.maps.DirectionsStatus.OK && result) {
-          directionsRenderer.setMap(map);
           directionsRenderer.setDirections(result);
           
-          // Fit bounds to include all stops and charging stations
           const bounds = new google.maps.LatLngBounds();
-          stops.forEach(stop => bounds.extend({ lat: stop.lat, lng: stop.lng }));
-          chargeStops.forEach(stop => bounds.extend(stop.location));
+          
+          // Add start location
+          bounds.extend(toLatLng(startLocation));
+          
+          // Add all stops
+          stops.forEach(stop => bounds.extend(toLatLng(stop)));
+          
+          // Add charge stops
+          chargeStops?.forEach(stop => {
+            if (stop?.location) {
+              bounds.extend(stop.location);
+            }
+          });
+          
           map.fitBounds(bounds);
         }
       });
     }
   };
 
-  const handlePlaceSelect = async () => {
-    if (!autocompleteRef.current) return;
-    
-    const place = autocompleteRef.current.getPlace();
-    if (!place.geometry?.location) {
-      setError('No location found for this place');
-      return;
-    }
-
-    const location: Location = {
-      lat: place.geometry.location.lat(),
-      lng: place.geometry.location.lng(),
-      address: place.formatted_address || place.name || searchInput
-    };
-
-    try {
-      await addStop(location);
-      setSearchInput('');
-      setError(null);
-    } catch (error) {
-      console.error('Error adding stop:', error);
-      setError('Failed to add stop');
-    }
-  };
-
-  const handleAddStop = async () => {
-    if (!searchInput.trim()) {
-      setError('Please enter a destination');
-      return;
-    }
-
-    if (autocompleteRef.current) {
-      const place = autocompleteRef.current.getPlace();
-      if (place?.geometry?.location) {
-        const location: Location = {
-          lat: place.geometry.location.lat(),
-          lng: place.geometry.location.lng(),
-          address: place.formatted_address || place.name || searchInput
-        };
-        try {
-          await addStop(location);
-          setSearchInput('');
-        } catch (error) {
-          console.error('Error adding stop:', error);
-          setError('Failed to add stop');
-        }
-        return;
-      }
-
-      // If no place is selected, use Places Service to find one
-      const placesService = new google.maps.places.PlacesService(map!);
-      
-      try {
-        const results = await new Promise<google.maps.places.PlaceResult[]>((resolve, reject) => {
-          placesService.findPlaceFromQuery({
-            query: searchInput,
-            fields: ['formatted_address', 'geometry', 'name']
-          }, (results, status) => {
-            if (status === google.maps.places.PlacesServiceStatus.OK && results) {
-              resolve(results);
-            } else {
-              reject(new Error('Place not found'));
-            }
-          });
-        });
-
-        if (results[0]?.geometry?.location) {
-          const result = results[0];
-          const location: Location = {
-            lat: result.geometry.location.lat(),
-            lng: result.geometry.location.lng(),
-            address: result.formatted_address || result.name || searchInput
-          };
-          await addStop(location);
-          setSearchInput('');
-        } else {
-          setError('Could not find location. Please try a different search.');
-        }
-      } catch (error) {
-        console.error('Error finding place:', error);
-        setError('Could not find location. Please try a different search.');
-      }
-    }
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setSearchInput(e.target.value);
   };
 
   return (
@@ -315,22 +388,40 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
         </div>
       )}
 
-      <div className="flex gap-4">
-        <input
-          id="location-input"
-          type="text"
-          value={searchInput}
-          onChange={(e) => setSearchInput(e.target.value)}
-          placeholder="Enter a destination"
-          className="flex-1 px-4 py-2 border rounded focus:ring-2 focus:ring-blue-500"
-          autoComplete="off"
-        />
-        <button
-          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-          onClick={handleAddStop}
-        >
-          Add Stop
-        </button>
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center gap-2">
+          <input
+            id="location-input"
+            type="text"
+            value={searchInput}
+            onChange={handleInputChange}
+            placeholder={isSettingStart ? "Enter starting location" : "Enter destination"}
+            className="flex-1 px-4 py-2 border rounded text-gray-900 bg-white focus:ring-2 focus:ring-blue-500"
+            autoComplete="off"
+          />
+        </div>
+
+        {startLocation && (
+          <div className="text-sm text-gray-600">
+            Starting from: {startLocation.address}
+            <button
+              onClick={() => {
+                setIsSettingStart(true);
+                setStartLocation(null);
+                setStops([]);
+                setChargeStops([]);
+                markers.forEach(marker => marker.setMap(null));
+                setMarkers([]);
+                if (directionsRenderer) {
+                  directionsRenderer.setMap(null);
+                }
+              }}
+              className="ml-2 text-blue-500 hover:text-blue-600"
+            >
+              Change
+            </button>
+          </div>
+        )}
       </div>
 
       <div 
@@ -338,17 +429,41 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
         className={`w-full h-[500px] rounded-lg shadow-lg ${error ? 'bg-gray-100' : ''}`}
       />
 
+      {/* New Route Summary Section */}
+      <div className="flex flex-col gap-4 p-4 bg-gray-50 rounded-lg">
+        <h3 className="font-semibold text-lg mb-2">Route Summary</h3>
+        <div className="space-y-3">
+          {startLocation && (
+            <div className="flex items-center gap-3">
+              <span className="flex items-center justify-center w-6 h-6 bg-blue-500 text-white rounded-full font-semibold">
+                A
+              </span>
+              <span className="text-gray-900">{startLocation.address}</span>
+            </div>
+          )}
+          
+          {stops.length > 0 && (
+            <div className="flex items-center gap-3">
+              <span className="flex items-center justify-center w-6 h-6 bg-blue-500 text-white rounded-full font-semibold">
+                B
+              </span>
+              <span className="text-gray-900">{stops[stops.length - 1].address}</span>
+            </div>
+          )}
+        </div>
+      </div>
+
       {isLoading ? (
         <div className="flex justify-center">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500" />
         </div>
       ) : (
         <>
-          <div className="space-y-2">
+          <div className="flex flex-col gap-2">
             <h3 className="font-semibold">Stops:</h3>
             {stops.map((stop, index) => (
-              <div key={index} className="flex items-center gap-2 p-2 bg-gray-50 rounded">
-                <span className="font-medium">{index + 1}.</span>
+              <div key={index} className="flex items-center gap-2 text-gray-900">
+                <span>{index + 1}.</span>
                 <span>{stop.address}</span>
               </div>
             ))}
