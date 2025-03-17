@@ -16,10 +16,14 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
   const [error, setError] = useState<string | null>(null);
   const [markers, setMarkers] = useState<google.maps.Marker[]>([]);
   const [directionsRenderer, setDirectionsRenderer] = useState<google.maps.DirectionsRenderer | null>(null);
-  const [searchInput, setSearchInput] = useState('');
-  const autocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
+  const [startInput, setStartInput] = useState('');
+  const [destInput, setDestInput] = useState('');
+  const startAutocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
+  const destAutocompleteRef = useRef<google.maps.places.Autocomplete | null>(null);
   const [startLocation, setStartLocation] = useState<Location | null>(null);
-  const [isSettingStart, setIsSettingStart] = useState(true);
+  const [isSettingStart, setIsSettingStart] = useState<boolean>(true);
+  const [hasStartLocation, setHasStartLocation] = useState<boolean>(false);
+  const [destination, setDestination] = useState<Location | null>(null);
 
   const directionsService = useRef<google.maps.DirectionsService | null>(null);
 
@@ -27,92 +31,6 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
     lat: location.lat,
     lng: location.lng
   });
-
-  const initMap = () => {
-    if (!mapRef.current || !window.google) {
-      console.error('Google Maps not loaded');
-      setError('Failed to load Google Maps. Please check your API key configuration.');
-      return;
-    }
-
-    try {
-      const mapInstance = new google.maps.Map(mapRef.current, {
-        center: { lat: 40.7128, lng: -74.0060 }, // Default to NYC
-        zoom: 4,
-        mapTypeControl: true,
-        streetViewControl: true,
-        fullscreenControl: true,
-        zoomControl: true
-      });
-
-      setMap(mapInstance);
-
-      const renderer = new google.maps.DirectionsRenderer({
-        suppressMarkers: true,
-        preserveViewport: false // Allow map to auto-zoom to show route
-      });
-      renderer.setMap(mapInstance);
-      setDirectionsRenderer(renderer);
-
-      setupPlacesAutocomplete(mapInstance);
-    } catch (error) {
-      console.error('Map initialization error:', error);
-      setError('Failed to initialize map. Please refresh the page or try again later.');
-    }
-  };
-
-  // Add this helper function back
-  const getFormattedAddress = (place: google.maps.places.PlaceResult): string => {
-    if (place.name && place.types?.includes('establishment')) {
-      return place.name;
-    }
-    return place.formatted_address || place.name || '';
-  };
-
-  // Update the setupPlacesAutocomplete function
-  const setupPlacesAutocomplete = (mapInstance: google.maps.Map) => {
-    const input = document.getElementById('location-input') as HTMLInputElement;
-    if (!input) return;
-
-    const autocomplete = new google.maps.places.Autocomplete(input);
-    autocomplete.bindTo('bounds', mapInstance);
-    autocompleteRef.current = autocomplete;
-
-    autocomplete.addListener('place_changed', () => {
-      const place = autocomplete.getPlace();
-      if (!place.geometry?.location) return;
-
-      const location: Location = {
-        lat: place.geometry.location.lat(),
-        lng: place.geometry.location.lng(),
-        address: place.formatted_address || place.name || ''
-      };
-
-      // Update map and markers
-      mapInstance.setCenter(location);
-      mapInstance.setZoom(13);
-
-      if (isSettingStart) {
-        // Clear previous markers
-        markers.forEach(marker => marker.setMap(null));
-        setMarkers([]);
-
-        // Add new start marker
-        const marker = new google.maps.Marker({
-          position: location,
-          map: mapInstance,
-          label: { text: 'A', color: 'white', fontSize: '14px' },
-          title: `Start: ${location.address}`
-        });
-        setMarkers([marker]);
-        setStartLocation(location);
-        setIsSettingStart(false);
-      } else {
-        addStop(location);
-      }
-      setSearchInput('');
-    });
-  };
 
   useEffect(() => {
     if (!mapRef.current || !window.google) return;
@@ -128,84 +46,212 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
 
     setMap(mapInstance);
 
+    // Initialize DirectionsService
+    directionsService.current = new google.maps.DirectionsService();
+
+    // Initialize DirectionsRenderer
     const renderer = new google.maps.DirectionsRenderer({
-      suppressMarkers: true,
+      suppressMarkers: true, // We'll handle markers ourselves
+      map: mapInstance, // Attach to map immediately
       preserveViewport: false
     });
-    renderer.setMap(mapInstance);
     setDirectionsRenderer(renderer);
 
     setupPlacesAutocomplete(mapInstance);
+
+    return () => {
+      markers.forEach(marker => marker.setMap(null));
+      renderer.setMap(null);
+      if (startAutocompleteRef.current) {
+        google.maps.event.clearInstanceListeners(startAutocompleteRef.current);
+      }
+      if (destAutocompleteRef.current) {
+        google.maps.event.clearInstanceListeners(destAutocompleteRef.current);
+      }
+    };
   }, []);
 
-  const handleSetStart = (location: Location) => {
-    if (!map) return;
+  useEffect(() => {
+    // Synchronize state with localStorage on mount
+    const savedStart = localStorage.getItem('startLocation');
     
-    clearMap();
-    setStartLocation(location);
-    setIsSettingStart(false);
+    if (savedStart) {
+      const parsedStart = JSON.parse(savedStart);
+      setStartLocation(parsedStart);
+      setHasStartLocation(true);
+      setIsSettingStart(false);
+      console.log('🔄 Initialized from localStorage:', {
+        address: parsedStart.address,
+        hasStartLocation: true,
+        isSettingStart: false
+      });
+    } else {
+      setHasStartLocation(false);
+      setIsSettingStart(true);
+      console.log('🔄 No saved location found, ready for start location');
+    }
+  }, []); // Empty dependency array for mount only
 
-    // Create marker
-    const marker = new google.maps.Marker({
-      position: { lat: location.lat, lng: location.lng },
-      map: map,
+  useEffect(() => {
+    if (startLocation) {
+      // Update localStorage and state atomically
+      localStorage.setItem('startLocation', JSON.stringify(startLocation));
+      setHasStartLocation(true);
+      setIsSettingStart(false);
+
+      console.log('✅ Start location updated:', {
+        address: startLocation.address,
+        hasStartLocation: true,
+        isSettingStart: false
+      });
+    }
+  }, [startLocation]);
+
+  // Add this useEffect to monitor hasStartLocation changes
+  useEffect(() => {
+    console.log('🔍 hasStartLocation changed:', {
+      hasStartLocation,
+      isSettingStart,
+      currentStart: startLocation?.address
+    });
+  }, [hasStartLocation, isSettingStart, startLocation]);
+
+  // Add a useEffect to monitor isSettingStart changes
+  useEffect(() => {
+    console.log('🚩 isSettingStart changed:', {
+      isSettingStart,
+      hasStartLocation,
+      currentStart: startLocation?.address
+    });
+  }, [isSettingStart]);
+
+  const setupPlacesAutocomplete = (mapInstance: google.maps.Map) => {
+    const startInput = document.getElementById('start-location-input') as HTMLInputElement;
+    const destInput = document.getElementById('dest-location-input') as HTMLInputElement;
+    if (!startInput || !destInput) return;
+
+    // Setup start location autocomplete
+    const startAutocomplete = new google.maps.places.Autocomplete(startInput);
+    startAutocomplete.bindTo('bounds', mapInstance);
+    startAutocompleteRef.current = startAutocomplete;
+
+    // Setup destination autocomplete
+    const destAutocomplete = new google.maps.places.Autocomplete(destInput);
+    destAutocomplete.bindTo('bounds', mapInstance);
+    destAutocompleteRef.current = destAutocomplete;
+
+    // Handle start location selection
+    startAutocomplete.addListener('place_changed', () => {
+      const place = startAutocomplete.getPlace();
+      if (!place.geometry?.location) return;
+
+      const location: Location = {
+        lat: place.geometry.location.lat(),
+        lng: place.geometry.location.lng(),
+        address: place.formatted_address || place.name || ''
+      };
+
+      handleStartLocation(location, mapInstance);
+      setStartInput('');
+    });
+
+    // Handle destination selection
+    destAutocomplete.addListener('place_changed', () => {
+      const place = destAutocomplete.getPlace();
+      if (!place.geometry?.location) return;
+
+      const location: Location = {
+        lat: place.geometry.location.lat(),
+        lng: place.geometry.location.lng(),
+        address: place.formatted_address || place.name || ''
+      };
+
+      handleDestination(location, mapInstance);
+      setDestInput('');
+    });
+  };
+
+  const handleStartLocation = (location: Location, mapInstance: google.maps.Map) => {
+    console.log('🏁 Setting START location:', location.address);
+    markers.forEach(marker => marker.setMap(null));
+    
+    const startMarker = new google.maps.Marker({
+      position: location,
+      map: mapInstance,
       label: { text: 'A', color: 'white', fontSize: '14px' },
       title: `Start: ${location.address}`
     });
-    setMarkers([marker]);
 
-    // Update map view
-    map.setCenter({ lat: location.lat, lng: location.lng });
-    map.setZoom(13);
+    setStartLocation(location);
+    setMarkers([startMarker]);
+    
+    mapInstance.setCenter(location);
+    mapInstance.setZoom(13);
   };
 
-  const addStop = async (location: Location) => {
-    if (!startLocation) {
-      handleSetStart(location);
+  const handleDestination = (location: Location, mapInstance: google.maps.Map) => {
+    if (!startLocation || !directionsService.current || !directionsRenderer) {
+      console.error('Missing required services or start location');
       return;
     }
 
-    // Set the destination
+    console.log('🎯 Adding DESTINATION:', {
+      from: startLocation.address,
+      to: location.address
+    });
+    
+    // Clear existing markers first
+    markers.forEach(marker => marker.setMap(null));
+    
+    // Add start marker
+    const startMarker = new google.maps.Marker({
+      position: toLatLng(startLocation),
+      map: mapInstance,
+      label: { text: 'A', color: 'white', fontSize: '14px' },
+      title: `Start: ${startLocation.address}`
+    });
+
+    // Add destination marker
+    const destMarker = new google.maps.Marker({
+      position: toLatLng(location),
+      map: mapInstance,
+      label: { text: 'B', color: 'white', fontSize: '14px' },
+      title: `Destination: ${location.address}`
+    });
+
+    setMarkers([startMarker, destMarker]);
+    setDestination(location);
     setStops([location]);
 
-    if (map) {
-      // Clear existing markers
-      markers.forEach(marker => marker.setMap(null));
-
-      // Create markers for both start and destination
-      const startMarker = new google.maps.Marker({
-        position: { lat: startLocation.lat, lng: startLocation.lng },
-        map,
-        label: { text: 'A', color: 'white', fontSize: '14px' },
-        title: `Start: ${startLocation.address}`
-      });
-
-      const destMarker = new google.maps.Marker({
-        position: { lat: location.lat, lng: location.lng },
-        map,
-        label: { text: 'B', color: 'white', fontSize: '14px' },
-        title: `Destination: ${location.address}`
-      });
-
-      setMarkers([startMarker, destMarker]);
-
-      // Calculate route
-      if (directionsRenderer) {
-        const request: google.maps.DirectionsRequest = {
-          origin: { lat: startLocation.lat, lng: startLocation.lng },
-          destination: { lat: location.lat, lng: location.lng },
-          travelMode: google.maps.TravelMode.DRIVING
-        };
-
-        const service = new google.maps.DirectionsService();
-        service.route(request, (result, status) => {
-          if (status === google.maps.DirectionsStatus.OK && result) {
-            directionsRenderer.setDirections(result);
-            map.fitBounds(result.routes[0].bounds);
-          }
-        });
+    // Calculate and display route
+    const request: google.maps.DirectionsRequest = {
+      origin: toLatLng(startLocation),
+      destination: toLatLng(location),
+      travelMode: google.maps.TravelMode.DRIVING
+    };
+    
+    directionsService.current.route(request, (result, status) => {
+      if (status === google.maps.DirectionsStatus.OK && result) {
+        directionsRenderer.setMap(mapInstance); // Ensure renderer is attached to map
+        directionsRenderer.setDirections(result);
+        
+        // Create bounds that include both points
+        const bounds = new google.maps.LatLngBounds();
+        bounds.extend(toLatLng(startLocation));
+        bounds.extend(toLatLng(location));
+        
+        // Fit the map to show both points with padding
+        mapInstance.fitBounds(bounds);
+        mapInstance.panToBounds(bounds, { top: 50, right: 50, bottom: 50, left: 50 });
+        
+        console.log('📍 Route calculated and displayed');
+      } else {
+        console.error('Failed to calculate route:', status);
       }
-    }
+    });
+
+    // Calculate route with charging stops if needed
+    calculateRoute([startLocation, location]);
   };
 
   const calculateRoute = async (routeStops: Location[]) => {
@@ -379,6 +425,31 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
     }
   };
 
+  const handleStartLocationChange = () => {
+    console.log('Changing start location');
+    
+    // Clear map first
+    clearMap();
+    
+    // Set isSettingStart first to ensure we're in the right mode
+    setIsSettingStart(true);
+    
+    // Then clear other states and localStorage
+    setStartLocation(null);
+    setHasStartLocation(false);
+    setStops([]);
+    setChargeStops([]);
+    
+    // Clear only relevant localStorage items
+    localStorage.removeItem('startLocation');
+    
+    console.log('Start location change initiated:', {
+      isSettingStart: true,
+      hasStartLocation: false,
+      startLocation: null
+    });
+  };
+
   return (
     <div className="flex flex-col gap-4">
       {error && (
@@ -398,14 +469,23 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
       )}
 
       <div className="flex flex-col gap-4">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-col gap-2">
           <input
-            id="location-input"
+            id="start-location-input"
             type="text"
-            value={searchInput}
-            onChange={handleInputChange}
-            placeholder={isSettingStart ? "Enter starting location" : "Enter destination"}
-            className="flex-1 px-4 py-2 border rounded text-gray-900 bg-white focus:ring-2 focus:ring-blue-500"
+            value={startInput}
+            onChange={(e) => setStartInput(e.target.value)}
+            placeholder="Enter starting location"
+            className="px-4 py-2 border rounded text-gray-900 bg-white focus:ring-2 focus:ring-blue-500"
+            autoComplete="off"
+          />
+          <input
+            id="dest-location-input"
+            type="text"
+            value={destInput}
+            onChange={(e) => setDestInput(e.target.value)}
+            placeholder="Enter destination"
+            className="px-4 py-2 border rounded text-gray-900 bg-white focus:ring-2 focus:ring-blue-500"
             autoComplete="off"
           />
         </div>
@@ -414,17 +494,7 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
           <div className="text-sm text-gray-600">
             Starting from: {startLocation.address}
             <button
-              onClick={() => {
-                setIsSettingStart(true);
-                setStartLocation(null);
-                setStops([]);
-                setChargeStops([]);
-                markers.forEach(marker => marker.setMap(null));
-                setMarkers([]);
-                if (directionsRenderer) {
-                  directionsRenderer.setMap(null);
-                }
-              }}
+              onClick={handleStartLocationChange}
               className="ml-2 text-blue-500 hover:text-blue-600"
             >
               Change
@@ -437,67 +507,6 @@ export default function RoutePlanner({ selectedModel, onLocationSelect }: RouteP
         ref={mapRef} 
         className={`w-full h-[500px] rounded-lg shadow-lg ${error ? 'bg-gray-100' : ''}`}
       />
-
-      {/* Route Summary Section */}
-      <div className="flex flex-col gap-4 p-4 bg-white rounded-lg shadow">
-        <h3 className="font-semibold text-lg mb-2 text-gray-900">Route Summary</h3>
-        <div className="space-y-3">
-          {startLocation && (
-            <div className="flex items-center gap-3">
-              <span className="flex items-center justify-center w-6 h-6 bg-blue-500 text-white rounded-full font-semibold">
-                A
-              </span>
-              <span className="text-gray-900">{startLocation.address}</span>
-            </div>
-          )}
-          
-          {stops.length > 0 && (
-            <div className="flex items-center gap-3">
-              <span className="flex items-center justify-center w-6 h-6 bg-blue-500 text-white rounded-full font-semibold">
-                B
-              </span>
-              <span className="text-gray-900">{stops[0].address}</span>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {isLoading ? (
-        <div className="flex justify-center">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500" />
-        </div>
-      ) : (
-        <>
-          <div className="flex flex-col gap-2">
-            <h3 className="font-semibold">Stops:</h3>
-            {stops.map((stop, index) => (
-              <div key={index} className="flex items-center gap-2 text-gray-900">
-                <span>{index + 1}.</span>
-                <span>{stop.address}</span>
-              </div>
-            ))}
-          </div>
-
-          {chargeStops.length > 0 && (
-            <div className="space-y-2">
-              <h3 className="font-semibold">Charging Stops:</h3>
-              {chargeStops.map((stop, index) => (
-                <div key={index} className="flex items-center justify-between p-2 bg-gray-50 rounded">
-                  <div>
-                    <span className="font-medium">{stop.name}</span>
-                    <span className="text-sm text-gray-500 ml-2">
-                      {Math.round(stop.distance)} miles
-                    </span>
-                  </div>
-                  <span className="text-sm">
-                    Charge time: {Math.round(stop.duration)} min
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </>
-      )}
     </div>
   );
 } 
